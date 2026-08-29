@@ -66,24 +66,18 @@ class CasualSelfAttention(nn.Module):
         q, k, v = qkv.split(self.n_embd, dim=2) # split the output of c_attn into 3 parts for query, key, value  
 
         # # hs is head size, which is embedding size divided by number of heads
-        # v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) 
-        # q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) 
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # # causal self-attention: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5)) # scaled dot-product attention
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # apply the causal mask
-        # att = F.softmax(att, dim=-1) # softmax to get the attention weights
+        # causal self-attention: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5)) # scaled dot-product attention
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # apply the causal mask
+        att = F.softmax(att, dim=-1) # softmax to get the attention weights
 
-        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-        #-----------------------------------------------------------------------------
-        # Using flash attention : 
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=self.bias[:,:,:T,:T],
-              dropout_p=self.attn_dropout.p if self.training else 0.0,
-              casual=True
-              )
+ 
 
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side    
@@ -214,47 +208,81 @@ if __name__ == "__main__":
 
     # --------------------------------------------------
     # Load the pretrained GPT-2 model
-    # model = GPT2Model.from_pretrained("gpt2") # Load the pretrained model from HuggingFace
-    model = GPT2Model(GPT2Config()) 
-    device="cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device) # Move the model to GPU if available
-    model = torch.compile(model) # Compile the model for faster training and inference
+    model = GPT2Model.from_pretrained("gpt2") # Load the pretrained model from HuggingFace
 
+    model.eval() # Set the model to evaluation mode
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    model = model.to(device) # Move the model to the appropriate device
+    # --------------------------------------------------
+    # Input prompt
+    # --------------------------------------------------
+    text = input("Enter a prompt: ")
 
+    input_tokens = encoder.encode(
+        text,
+        disallowed_special=()
+    )
 
+    # Convert to tensor and add batch dimension
+    input_tokens = torch.tensor(input_tokens,dtype=torch.long).unsqueeze(0)
 
-    ## Loading dataset 
-    path = r"\Dataset\input.txt"
-    with open(path , 'r', encoding='utf-8') as f:
-        data = f.read()
+    # Create 3 identical prompts
+    x = input_tokens.repeat(num_return_sequences,1).to(device)
 
-    tokens = encoder.encode(data[:1000], disallowed_special=()) # Encode the first 1000 characters of the dataset
-    B ,T  = 4 , 32
-    buf = torch.tensor(tokens[:B*T + 1], dtype=torch.long)
-    buf = buf.to(device)
-    x = buf[:-1].view(B, T).to(device) # Input tokens
-    y = buf[1:].view(B, T).to(device)  # Target tokens (next token prediction
+    prompt_length = x.shape[1]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4 ,betas=[0.9, 0.95], eps=1e-8) # AdamW optimizer
+    # --------------------------------------------------
+    # Reproducibility
+    # --------------------------------------------------
+    torch.manual_seed(42)
 
-    ## Training Loop 
-    for i in range(10):
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
-        t0 = time.time()
-        optimizer.zero_grad() # Zero the gradients
-        logits = model(x) # Forward pass
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1)) # Compute the loss
-        loss.backward() # Backward pass
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
-        optimizer.step() # Update the weights
+    # --------------------------------------------------
+    # Generate tokens
+    # --------------------------------------------------
+    with torch.no_grad():
 
-        t1 = time.time()
-        print(f"Step {i} - Loss: {loss.item()} - Time: {t1 - t0:.2f}s")
+        for _ in range(max_new_tokens):
 
-    import sys ; sys.exit(0) # Exit the script after training
+            # Forward pass
+            logits = model(x)
 
+            # Take logits of the last token
+            logits = logits[:, -1, :]
 
+            # Convert logits -> probabilities
+            prob = F.softmax(logits, dim=-1)
 
+            # --------------------------------------------------
+            # Top-k sampling
+            # --------------------------------------------------
+            top_prob, top_idx = torch.topk(prob,k=50,dim=-1)
 
-    
+            # Renormalize probabilities inside top-k
+            top_prob = top_prob / top_prob.sum(dim=-1,keepdim=True)
+
+            # Sample one token from top-k distribution
+            sampled_idx = torch.multinomial(top_prob,num_samples=1)
+
+            # Convert sampled top-k index
+            # into actual vocabulary index
+            next_token = top_idx.gather(-1,sampled_idx)
+
+            # Append token to sequence
+            x = torch.cat([x, next_token],dim=1)
+
+    # --------------------------------------------------
+    # Decode generated sequences
+    # --------------------------------------------------
+    for i in range(num_return_sequences):
+
+        # Keep prompt + generated tokens
+        tokens = x[i].tolist()
+
+        generated_text = encoder.decode(tokens)
+
+        print(f"\nGenerated text {i + 1}:")
+        print(generated_text)
